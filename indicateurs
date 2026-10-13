@@ -1,0 +1,119 @@
+"""
+build_dataset.py
+Une V-Dem (local) + Our World in Data + Banco Mundial
+en un solo dataset anual para Venezuela, 1999-2026.
+
+Uso:
+    python src/build_dataset.py
+
+Requiere tener descargado manualmente:
+    data/raw/vdem_full.csv   (ver README.md, sección "Fuentes de datos")
+"""
+
+import pandas as pd
+import requests
+from pathlib import Path
+
+YEAR_MIN = 1999
+YEAR_MAX = 2026
+RAW_DIR = Path("data/raw")
+OUT_DIR = Path("data/processed")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------- 1. V-Dem (archivo local, ver README) ----------
+def load_vdem():
+    path = RAW_DIR / "vdem_full.csv"
+    if not path.exists():
+        print(f"[AVISO] No encontré {path}. Descárgalo manualmente desde "
+              f"v-dem.net/data/the-v-dem-dataset/ y guárdalo ahí. "
+              f"Continúo sin estas columnas.")
+        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+
+    vdem = pd.read_csv(path, low_memory=False)
+    venezuela = vdem[(vdem["country_name"] == "Venezuela") & (vdem["year"] >= YEAR_MIN)]
+
+    cols = {
+        "v2x_libdem": "vdem_democracia_liberal",
+        "v2x_rule": "vdem_estado_derecho",
+        "v2x_civlib": "vdem_libertades_civiles",
+        "v2x_corr": "vdem_corrupcion_politica",
+        "v2svstterr": "vdem_control_territorial",
+    }
+    disponibles = {k: v for k, v in cols.items() if k in venezuela.columns}
+    out = venezuela[["year"] + list(disponibles.keys())].rename(columns=disponibles)
+    return out
+
+
+# ---------- 2. Our World in Data ----------
+def owid_indicador(slug, nombre_columna):
+    url = f"https://ourworldindata.org/grapher/{slug}.csv?v=1&csvType=full&useColumnShortNames=true"
+    try:
+        df = pd.read_csv(url)
+    except Exception as e:
+        print(f"[AVISO] Fallo al descargar {slug} de OWID: {e}")
+        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+
+    df = df[(df["Entity"] == "Venezuela") & (df["Year"] >= YEAR_MIN)]
+    value_col = [c for c in df.columns if c not in ("Entity", "Code", "Year")][0]
+    df = df[["Year", value_col]].rename(columns={"Year": "year", value_col: nombre_columna})
+    return df
+
+
+def load_owid():
+    liberal_dem = owid_indicador("liberal-democracy-index", "owid_democracia_liberal")
+    rule_of_law = owid_indicador("rule-of-law-index", "owid_estado_derecho")
+
+    out = liberal_dem.merge(rule_of_law, on="year", how="outer")
+    return out
+
+
+# ---------- 3. Banco Mundial (API pública) ----------
+def wb_indicador(codigo, nombre_columna):
+    url = (f"https://api.worldbank.org/v2/country/VEN/indicator/{codigo}"
+           f"?format=json&date={YEAR_MIN}:{YEAR_MAX}&per_page=100")
+    try:
+        r = requests.get(url, timeout=20)
+        data = r.json()[1]
+    except Exception as e:
+        print(f"[AVISO] Fallo al descargar {codigo} del Banco Mundial: {e}")
+        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+
+    df = pd.DataFrame(data)[["date", "value"]]
+    df["year"] = df["date"].astype(int)
+    df = df[["year", "value"]].rename(columns={"value": nombre_columna})
+    return df
+
+
+def load_worldbank():
+    deuda_pib = wb_indicador("GC.DOD.TOTL.GD.ZS", "wb_deuda_gobierno_pib")
+    reservas = wb_indicador("FI.RES.TOTL.CD", "wb_reservas_internacionales")
+    estado_derecho = wb_indicador("RL.EST", "wb_estado_derecho")
+    control_corrupcion = wb_indicador("CC.EST", "wb_control_corrupcion")
+
+    out = deuda_pib.merge(reservas, on="year", how="outer") \
+                    .merge(estado_derecho, on="year", how="outer") \
+                    .merge(control_corrupcion, on="year", how="outer")
+    return out
+
+
+# ---------- Unión final ----------
+def main():
+    vdem = load_vdem()
+    owid = load_owid()
+    wb = load_worldbank()
+
+    base = pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+    final = base.merge(vdem, on="year", how="left") \
+                .merge(owid, on="year", how="left") \
+                .merge(wb, on="year", how="left")
+
+    final = final.sort_values("year")
+    out_path = OUT_DIR / "venezuela_indicadores_1999_2026.csv"
+    final.to_csv(out_path, index=False)
+    print(f"Listo: {out_path}")
+    print(final.head(10))
+
+
+if __name__ == "__main__":
+    main()
