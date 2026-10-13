@@ -7,31 +7,58 @@ Uso:
     python src/build_dataset.py
 
 Requiere tener descargado manualmente:
-    data/raw/vdem_full.csv   (ver README.md, sección "Fuentes de datos")
+    data/raw/vdem_full.csv
 """
 
+from pathlib import Path
 import pandas as pd
 import requests
-from pathlib import Path
 
 YEAR_MIN = 1999
 YEAR_MAX = 2026
-RAW_DIR = Path("data/raw")
-OUT_DIR = Path("data/processed")
+
+# Detecta la raíz del proyecto aunque el script esté dentro de src/
+BASE_DIR = Path(__file__).resolve().parent
+if (BASE_DIR / "data").exists():
+    ROOT = BASE_DIR
+else:
+    ROOT = BASE_DIR.parent
+
+RAW_DIR = ROOT / "data" / "raw"
+OUT_DIR = ROOT / "data" / "processed"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------- 1. V-Dem (archivo local, ver README) ----------
+def empty_years_frame():
+    return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+
+
+# ---------- 1. V-Dem (archivo local) ----------
 def load_vdem():
     path = RAW_DIR / "vdem_full.csv"
     if not path.exists():
-        print(f"[AVISO] No encontré {path}. Descárgalo manualmente desde "
-              f"v-dem.net/data/the-v-dem-dataset/ y guárdalo ahí. "
-              f"Continúo sin estas columnas.")
-        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+        print(
+            f"[AVISO] No encontré {path}. Descárgalo manualmente desde "
+            f"v-dem.net/data/the-v-dem-dataset/ y guárdalo ahí. "
+            f"Continuo con años base."
+        )
+        return empty_years_frame()
 
-    vdem = pd.read_csv(path, low_memory=False)
-    venezuela = vdem[(vdem["country_name"] == "Venezuela") & (vdem["year"] >= YEAR_MIN)]
+    try:
+        vdem = pd.read_csv(path, low_memory=False)
+    except Exception as e:
+        print(f"[AVISO] No pude leer {path}: {e}")
+        return empty_years_frame()
+
+    required_cols = {"country_name", "year"}
+    if not required_cols.issubset(vdem.columns):
+        print(f"[AVISO] El CSV de V-Dem no tiene las columnas esperadas: {required_cols}")
+        return empty_years_frame()
+
+    venezuela = vdem[(vdem["country_name"] == "Venezuela") & (vdem["year"] >= YEAR_MIN)].copy()
+
+    if venezuela.empty:
+        return empty_years_frame()
 
     cols = {
         "v2x_libdem": "vdem_democracia_liberal",
@@ -40,24 +67,47 @@ def load_vdem():
         "v2x_corr": "vdem_corrupcion_politica",
         "v2svstterr": "vdem_control_territorial",
     }
+
     disponibles = {k: v for k, v in cols.items() if k in venezuela.columns}
+    if not disponibles:
+        print("[AVISO] No encontré columnas de V-Dem relevantes para Venezuela.")
+        return empty_years_frame()
+
     out = venezuela[["year"] + list(disponibles.keys())].rename(columns=disponibles)
+    out = out.drop_duplicates(subset="year", keep="last").sort_values("year")
     return out
 
 
 # ---------- 2. Our World in Data ----------
 def owid_indicador(slug, nombre_columna):
-    url = f"https://ourworldindata.org/grapher/{slug}.csv?v=1&csvType=full&useColumnShortNames=true"
+    url = (
+        f"https://ourworldindata.org/grapher/{slug}.csv?v=1"
+        f"&csvType=full&useColumnShortNames=true"
+    )
     try:
         df = pd.read_csv(url)
     except Exception as e:
         print(f"[AVISO] Fallo al descargar {slug} de OWID: {e}")
-        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+        return empty_years_frame()
 
-    df = df[(df["Entity"] == "Venezuela") & (df["Year"] >= YEAR_MIN)]
-    value_col = [c for c in df.columns if c not in ("Entity", "Code", "Year")][0]
-    df = df[["Year", value_col]].rename(columns={"Year": "year", value_col: nombre_columna})
-    return df
+    if df.empty or "Entity" not in df.columns or "Year" not in df.columns:
+        print(f"[AVISO] OWID {slug} no devolvió columnas esperadas.")
+        return empty_years_frame()
+
+    df = df[(df["Entity"].astype(str).str.strip() == "Venezuela") & (df["Year"] >= YEAR_MIN)].copy()
+
+    if df.empty:
+        return empty_years_frame()
+
+    value_cols = [c for c in df.columns if c not in ("Entity", "Code", "Year")]
+    if not value_cols:
+        print(f"[AVISO] OWID {slug} no tiene una columna de valor.")
+        return empty_years_frame()
+
+    value_col = value_cols[0]
+    out = df[["Year", value_col]].rename(columns={"Year": "year", value_col: nombre_columna})
+    out = out.drop_duplicates(subset="year", keep="last").sort_values("year")
+    return out
 
 
 def load_owid():
@@ -70,19 +120,40 @@ def load_owid():
 
 # ---------- 3. Banco Mundial (API pública) ----------
 def wb_indicador(codigo, nombre_columna):
-    url = (f"https://api.worldbank.org/v2/country/VEN/indicator/{codigo}"
-           f"?format=json&date={YEAR_MIN}:{YEAR_MAX}&per_page=100")
+    url = (
+        f"https://api.worldbank.org/v2/country/VEN/indicator/{codigo}"
+        f"?format=json&date={YEAR_MIN}:{YEAR_MAX}&per_page=100"
+    )
+
     try:
         r = requests.get(url, timeout=20)
-        data = r.json()[1]
+        r.raise_for_status()
+        payload = r.json()
     except Exception as e:
         print(f"[AVISO] Fallo al descargar {codigo} del Banco Mundial: {e}")
-        return pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
+        return empty_years_frame()
 
-    df = pd.DataFrame(data)[["date", "value"]]
-    df["year"] = df["date"].astype(int)
-    df = df[["year", "value"]].rename(columns={"value": nombre_columna})
-    return df
+    if not isinstance(payload, list) or len(payload) < 2:
+        print(f"[AVISO] La API del Banco Mundial devolvió un payload inesperado para {codigo}.")
+        return empty_years_frame()
+
+    data = payload[1]
+    if not data:
+        print(f"[AVISO] Banco Mundial no devolvió datos para {codigo}.")
+        return empty_years_frame()
+
+    df = pd.DataFrame(data)
+    if "date" not in df.columns or "value" not in df.columns:
+        print(f"[AVISO] Banco Mundial {codigo} no trae columnas esperadas.")
+        return empty_years_frame()
+
+    df = df[["date", "value"]].copy()
+    df["year"] = pd.to_numeric(df["date"], errors="coerce")
+    df = df.dropna(subset=["year"]).copy()
+    df["year"] = df["year"].astype(int)
+    out = df[["year", "value"]].rename(columns={"value": nombre_columna})
+    out = out.drop_duplicates(subset="year", keep="last").sort_values("year")
+    return out
 
 
 def load_worldbank():
@@ -91,9 +162,11 @@ def load_worldbank():
     estado_derecho = wb_indicador("RL.EST", "wb_estado_derecho")
     control_corrupcion = wb_indicador("CC.EST", "wb_control_corrupcion")
 
-    out = deuda_pib.merge(reservas, on="year", how="outer") \
-                    .merge(estado_derecho, on="year", how="outer") \
-                    .merge(control_corrupcion, on="year", how="outer")
+    out = (
+        deuda_pib.merge(reservas, on="year", how="outer")
+        .merge(estado_derecho, on="year", how="outer")
+        .merge(control_corrupcion, on="year", how="outer")
+    )
     return out
 
 
@@ -104,15 +177,19 @@ def main():
     wb = load_worldbank()
 
     base = pd.DataFrame({"year": range(YEAR_MIN, YEAR_MAX + 1)})
-    final = base.merge(vdem, on="year", how="left") \
-                .merge(owid, on="year", how="left") \
-                .merge(wb, on="year", how="left")
 
-    final = final.sort_values("year")
+    final = (
+        base.merge(vdem, on="year", how="left")
+        .merge(owid, on="year", how="left")
+        .merge(wb, on="year", how="left")
+    )
+
+    final = final.sort_values("year").reset_index(drop=True)
     out_path = OUT_DIR / "venezuela_indicadores_1999_2026.csv"
     final.to_csv(out_path, index=False)
+
     print(f"Listo: {out_path}")
-    print(final.head(10))
+    print(final.head(10).to_string(index=False))
 
 
 if __name__ == "__main__":
